@@ -1,0 +1,35 @@
+Configure Environment variables: 
+
+export TELEGRAM_API_KEY="your_bot_token"
+export TELEGRAM_GROUP_ID="-123456789"
+export WEB3_PROVIDER_URL="https://mainnet.infura.io/v3/your_key"
+
+
+Run the system:
+
+python3 alpha_bot.py
+
+
+Telegram commands:
+
+/start - Initialize bot
+/portfolio - View current positions
+/analyze 0x... - Check specific contract
+
+
+Trade Workflow:
+
+sequenceDiagram
+    participant Pumpfun
+    participant Analyzer
+    participant Telegram
+    participant Blockchain
+    
+    Pumpfun->>Analyzer: New listings
+    Analyzer->>Rugcheck: Verify contract
+    Analyzer->>Twitter: Check social
+    Analyzer->>Blockchain: Analyze contract
+    Analyzer->>Telegram: Send trade alert
+    Telegram->>Blockchain: Execute trade
+    Blockchain->>Telegram: Confirm TX
+    Telegram->>Database: Log trade
