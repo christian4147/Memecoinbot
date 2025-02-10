@@ -1,0 +1,199 @@
+import os
+import time
+import requests
+import pandas as pd
+from web3 import Web3
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float, JSON, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from dotenv import load_dotenv
+from typing import Dict, List, Optional, Set
+from datetime import datetime, timedelta
+import telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
+load_dotenv()
+Base = declarative_base()
+
+# Master Configuration
+class Config:
+    # API Endpoints
+    PUMPFUN_API = "https://api.pumpfun.com/v1"
+    TWEETSCOUT_API = "https://api.tweetscout.io/v1"
+    RUGCHECK_API = "https://api.rugcheck.xyz/v1"
+    WEB3_PROVIDER = os.getenv("WEB3_PROVIDER_URL")
+    
+    # Authentication
+    TWEETSCOUT_KEY = os.getenv("TWEETSCOUT_API_KEY")
+    RUGCHECK_KEY = os.getenv("RUGCHECK_API_KEY")
+    TG_API_KEY = os.getenv("TELEGRAM_API_KEY")
+    TG_GROUP_ID = os.getenv("TELEGRAM_GROUP_ID")
+    
+    # Trading Parameters
+    TRADE_SETTINGS = {
+        'MAX_POSITION_SIZE': 0.1,  # ETH
+        'STOP_LOSS': 0.15,
+        'TAKE_PROFIT': 0.3,
+        'MAX_TRADES_PER_DAY': 5
+    }
+    
+    # Security Settings
+    BLACKLISTS = {
+        'CONTRACT': set(os.getenv("CONTRACT_BLACKLIST", "").split(",")),
+        'DEV': set(os.getenv("DEV_BLACKLIST", "").split(","))
+    }
+
+# Database Model
+class TradedCoin(Base):
+    __tablename__ = "traded_coins"
+    
+    id = Column(Integer, primary_key=True)
+    contract_address = Column(String(42), unique=True)
+    symbol = Column(String(10))
+    entry_price = Column(Float)
+    exit_price = Column(Float)
+    status = Column(String(20))  # Monitoring, Exited, Liquidated
+    trade_data = Column(JSON)
+    analysis_data = Column(JSON)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# Telegram Bot Handler
+class BonkBot:
+    def __init__(self):
+        self.app = ApplicationBuilder().token(Config.TG_API_KEY).build()
+        self.active_trades = {}
+        
+        # Register handlers
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("portfolio", self.portfolio))
+        self.app.add_handler(CallbackQueryHandler(self.button_handler))
+        
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🚀 BonkBot Trading System Active\n\n"
+                 "/portfolio - View current positions\n"
+                 "/analyze [contract] - Analyze specific token"
+        )
+        
+    async def portfolio(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Retrieve and format portfolio data
+        pass
+        
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        
+    def send_alert(self, message: str, urgent: bool = False):
+        try:
+            asyncio.run(
+                self.app.bot.send_message(
+                    chat_id=Config.TG_GROUP_ID,
+                    text=f"🔔 {message}",
+                    parse_mode='Markdown'
+                )
+            )
+        except Exception as e:
+            print(f"Telegram send failed: {str(e)}")
+            
+    def format_trade_alert(self, symbol: str, contract: str, analysis: dict) -> str:
+        return (
+            f"*New Trade Opportunity*\n"
+            f"🏷 {symbol} | `{contract}`\n"
+            f"📈 Score: {analysis.get('score', 0)}\n"
+            f"💧 Liquidity: {analysis.get('liquidity', 0)} ETH\n"
+            f"🕵️ Risk: {analysis.get('risk', 'Medium')}\n"
+            f"🔗 [Chart](https://dexscreener.com/{contract})"
+        )
+
+# Consolidated Trading System
+class AlphaTradingSystem:
+    def __init__(self):
+        self.web3 = Web3(Web3.HTTPProvider(Config.WEB3_PROVIDER))
+        self.db_engine = create_engine("sqlite:///trading_db.sqlite")
+        self.tg_bot = BonkBot()
+        self.trade_count = 0
+        
+        # Initialize components
+        Base.metadata.create_all(self.db_engine)
+        self.session = sessionmaker(bind=self.db_Engine)()
+        
+    async def analyze_and_trade(self):
+        """Main trading loop"""
+        while True:
+            try:
+                coins = self._get_new_listings()
+                for coin in coins:
+                    if self._is_valid_trade(coin):
+                        trade_data = self._execute_trade(coin)
+                        self._log_trade(trade_data)
+                        self.tg_bot.send_alert(
+                            self.tg_bot.format_trade_alert(
+                                coin['symbol'],
+                                coin['contract'],
+                                trade_data['analysis']
+                            )
+                        )
+                await asyncio.sleep(60)
+            except Exception as e:
+                print(f"Main loop error: {str(e)}")
+                await asyncio.sleep(30)
+                
+    def _get_new_listings(self) -> List[Dict]:
+        """Retrieve new coins from multiple sources"""
+        # Implementation combining Pumpfun, TwitterScout, etc.
+        pass
+        
+    def _is_valid_trade(self, coin: Dict) -> bool:
+        """Comprehensive security check"""
+        checks = [
+            self._rugcheck_verification(coin['contract']),
+            self._liquidity_check(coin['liquidity']),
+            self._blacklist_check(coin),
+            self._social_verification(coin),
+            self._trading_limits_ok()
+        ]
+        return all(checks)
+        
+    def _execute_trade(self, coin: Dict) -> Dict:
+        """Execute on-chain trade"""
+        # Implementation using web3.py
+        return {
+            'tx_hash': '0x...',
+            'amount': Config.TRADE_SETTINGS['MAX_POSITION_SIZE'],
+            'analysis': coin['analysis']
+        }
+        
+    def _log_trade(self, data: Dict):
+        """Record trade in database"""
+        trade = TradedCoin(
+            contract_address=data['contract'],
+            symbol=data['symbol'],
+            trade_data=data
+        )
+        self.session.add(trade)
+        self.session.commit()
+        
+    # Implement security checks from previous versions
+    def _rugcheck_verification(self, contract: str) -> bool:
+        """Verify contract through Rugcheck API"""
+        pass
+        
+    def _social_verification(self, coin: Dict) -> bool:
+        """Check TwitterScout analysis"""
+        pass
+        
+    def _blacklist_check(self, coin: Dict) -> bool:
+        """Check against all blacklists"""
+        pass
+
+# Main Execution
+if __name__ == "__main__":
+    system = AlphaTradingSystem()
+    
+    # Start Telegram bot
+    system.tg_bot.app.run_polling()
+    
+    # Start trading loop
+    asyncio.run(system.analyze_and_trade())
