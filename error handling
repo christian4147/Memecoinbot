@@ -1,0 +1,157 @@
+import os
+import asyncio
+import signal
+import logging
+from logging.handlers import RotatingFileHandler
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_log,
+    after_log,
+    before_sleep_log
+)
+from tenacity import RetryError
+from contextlib import asynccontextmanager
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler('bot.log', maxBytes=1e6, backupCount=3),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class CircuitBreakerException(Exception):
+    """Custom exception for circuit breaker pattern"""
+    pass
+
+# Retry configuration
+COMMON_RETRY = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((IOError, TimeoutError)),
+    before=before_log(logger, logging.DEBUG),
+    after=after_log(logger, logging.DEBUG),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True
+)
+
+class AsyncTradingSystem:
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.running = False
+        self._circuit_breakers = {}
+
+    async def _db_operation(self, query):
+        """Context manager for safe database operations"""
+        @asynccontextmanager
+        async def db_session():
+            session = self.Session()
+            try:
+                yield session
+                await session.commit()
+            except Exception as e:
+                self.logger.error(f"DB error: {str(e)}")
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+        
+        async with db_session() as session:
+            return await session.execute(query)
+
+    @COMMON_RETRY
+    async def _execute_trade(self, coin: Dict) -> Dict:
+        """Robust trade execution with retries"""
+        try:
+            # Trade implementation
+            return {'status': 'success'}
+        except Exception as e:
+            self.logger.error(f"Trade failed: {str(e)}", exc_info=True)
+            raise
+
+    def _circuit_breaker(self, service: str):
+        """Circuit breaker decorator"""
+        def decorator(func):
+            async def wrapper(*args, **kwargs):
+                if self._circuit_breakers.get(service, 0) > 2:
+                    raise CircuitBreakerException(f"Service {service} unavailable")
+                
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    self._circuit_breakers[service] = self._circuit_breakers.get(service, 0) + 1
+                    self.logger.warning(f"Circuit breaker count for {service}: {self._circuit_breakers[service]}")
+                    raise
+            return wrapper
+        return decorator
+
+    async def shutdown(self):
+        """Graceful shutdown procedure"""
+        self.logger.info("Initiating shutdown sequence")
+        self.running = False
+        
+        # Close resources
+        await self.web3.provider.disconnect()
+        await self.db_engine.dispose()
+        
+        self.logger.info("Resources released. Shutdown complete")
+
+    async def handle_signal(self):
+        """Signal handler for graceful shutdown"""
+        self.logger.info("Received termination signal")
+        await self.shutdown()
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        [task.cancel() for task in tasks]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        asyncio.get_event_loop().stop()
+
+class AsyncBonkBot:
+    @COMMON_RETRY
+    async def send_alert(self, message: str):
+        """Reliable alert delivery with retries"""
+        try:
+            await self.app.bot.send_message(...)
+        except telegram.error.TimedOut:
+            self.logger.warning("Telegram API timeout")
+            raise
+        except telegram.error.NetworkError:
+            self.logger.error("Telegram network failure")
+            raise
+
+# Signal handling setup
+def setup_signals(system):
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(
+            sig,
+            lambda: asyncio.create_task(system.handle_signal())
+        )
+
+async def main():
+    system = AsyncTradingSystem()
+    setup_signals(system)
+    
+    try:
+        system.running = True
+        await system.concurrent_main()
+    except CircuitBreakerException as e:
+        system.logger.critical(f"Critical failure: {str(e)}")
+    except RetryError as e:
+        system.logger.error(f"Permanent failure after retries: {str(e)}")
+    except Exception as e:
+        system.logger.critical(f"Unexpected error: {str(e)}", exc_info=True)
+    finally:
+        if system.running:
+            await system.shutdown()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
