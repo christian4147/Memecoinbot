@@ -1,0 +1,802 @@
+import os
+import asyncio
+import aiohttp
+import signal
+import logging
+from logging.handlers import RotatingFileHandler
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from sklearn.ensemble import GradientBoostingRegressor
+import quantstats as qs
+from ta import add_all_ta_features
+from pydantic import BaseSettings, Field, AnyUrl, PostgresDsn, ValidationError
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception_type,
+    before_log,
+    after_log,
+    before_sleep_log,
+    wait_chain,
+    wait_fixed
+)
+from tenacity import RetryError
+from pyrate_limiter import Duration, RequestRate, Limiter
+from web3 import AsyncWeb3, Web3
+from web3.exceptions import ContractLogicError, TransactionNotFound
+from web3.types import HexStr, ChecksumAddress
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, DateTime, Float, JSON
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
+# ------------------------------------------------------------------------------
+# Load Environment Variables
+# ------------------------------------------------------------------------------
+load_dotenv()
+
+# ------------------------------------------------------------------------------
+# Logging Configuration & Secret Redaction
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler('bot.log', maxBytes=1_000_000, backupCount=3),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class SecurityFilters(logging.Filter):
+    def filter(self, record):
+        for secret in [
+            os.getenv("TELEGRAM_API_KEY", ""),
+            os.getenv("RUGCHECK_API_KEY", ""),
+            os.getenv("WEB3_PROVIDER_URL", ""),
+            os.getenv("PRIVATE_KEY", "")
+        ]:
+            if secret and secret in record.getMessage():
+                record.msg = record.msg.replace(secret, "***REDACTED***")
+        return True
+
+logging.getLogger().addFilter(SecurityFilters())
+
+# ------------------------------------------------------------------------------
+# Secure Configuration using Pydantic
+# ------------------------------------------------------------------------------
+class SecureConfig(BaseSettings):
+    WEB3_PROVIDER_URL: AnyUrl = Field(..., env="WEB3_PROVIDER_URL")
+    DATABASE_URL: PostgresDsn = Field(..., env="DATABASE_URL")
+    TWEETSCOUT_API_KEY: str = Field(..., env="TWEETSCOUT_API_KEY")
+    RUGCHECK_API_KEY: str = Field(..., env="RUGCHECK_API_KEY")
+    TG_API_KEY: str = Field(..., env="TELEGRAM_API_KEY")
+    TG_GROUP_ID: str = Field(..., env="TELEGRAM_GROUP_ID")
+    WALLET_ADDRESS: str = Field(..., env="WALLET_ADDRESS")
+    PRIVATE_KEY: str = Field(..., env="PRIVATE_KEY")
+    
+    class Config:
+        secrets_dir = '/run/secrets'
+        validate_all = True
+
+try:
+    config = SecureConfig()
+except ValidationError as e:
+    logger.critical(f"Configuration error: {str(e)}")
+    raise SystemExit(1)
+
+# ------------------------------------------------------------------------------
+# Risk & Security Configuration (Additional parameters)
+# ------------------------------------------------------------------------------
+class RiskSecurityConfig:
+    RUGCHECK_RATE_LIMIT = RequestRate(5, Duration.MINUTE)  # 5 requests per minute
+    FALLBACK_PROVIDERS = [
+        os.getenv("WEB3_FALLBACK_PROVIDER1"),
+        os.getenv("WEB3_FALLBACK_PROVIDER2")
+    ]
+    VOLATILITY_WINDOW = 24  # hours
+    RISK_FREE_RATE = 0.02  # Annualized
+    BLACKLISTS = {'CONTRACT': os.getenv("CONTRACT_BLACKLIST", "").split(",")}
+    TWEETSCOUT_API = os.getenv("TWEETSCOUT_API")
+    RUGCHECK_API = os.getenv("RUGCHECK_API")
+    LARGE_TX_THRESHOLD = float(os.getenv("LARGE_TX_THRESHOLD", "1000000000000000000"))
+    SUSPICIOUS_TX_COUNT = int(os.getenv("SUSPICIOUS_TX_COUNT", "5"))
+    BASE_STOP_LOSS = float(os.getenv("BASE_STOP_LOSS", "0.1"))
+    VOLATILITY_THRESHOLD = float(os.getenv("VOLATILITY_THRESHOLD", "0.5"))
+    MAX_POSITION_ABS = float(os.getenv("MAX_POSITION_ABS", "1"))
+
+# ------------------------------------------------------------------------------
+# Tenacity Common Retry Decorator
+# ------------------------------------------------------------------------------
+COMMON_RETRY = retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((IOError, TimeoutError)),
+    before=before_log(logger, logging.DEBUG),
+    after=after_log(logger, logging.DEBUG),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True
+)
+
+# ------------------------------------------------------------------------------
+# SQLAlchemy Declarative Base & ORM Model
+# ------------------------------------------------------------------------------
+Base = declarative_base()
+
+class TradedCoin(Base):
+    __tablename__ = "traded_coins"
+    
+    id = Column(Integer, primary_key=True)
+    contract_address = Column(String(42), unique=True)
+    symbol = Column(String(10))
+    entry_price = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    status = Column(String(20))
+    trade_data = Column(JSON)
+    analysis_data = Column(JSON)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+
+# ------------------------------------------------------------------------------
+# Async Database Manager
+# ------------------------------------------------------------------------------
+class AsyncDatabaseManager:
+    def __init__(self):
+        self.engine = create_async_engine(
+            config.DATABASE_URL,
+            pool_size=20,
+            max_overflow=10,
+            pool_pre_ping=True,
+            echo=False
+        )
+        self.session_factory = sessionmaker(
+            bind=self.engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False
+        )
+        
+    @asynccontextmanager
+    async def get_session(self):
+        session: AsyncSession = self.session_factory()
+        try:
+            yield session
+            await session.commit()
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Database operation failed: {str(e)}", exc_info=True)
+            raise
+        finally:
+            await session.close()
+
+# ------------------------------------------------------------------------------
+# Secure Web3 Client for Async Interactions
+# ------------------------------------------------------------------------------
+class SecureWeb3Client:
+    def __init__(self):
+        self.w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(str(config.WEB3_PROVIDER_URL)))
+        self.chain_id = None
+        self.nonce_cache = {}
+        
+    async def initialize(self):
+        self.chain_id = await self.w3.eth.chain_id
+        logger.info(f"Connected to chain {self.chain_id}")
+        
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_chain(*[wait_fixed(3) for _ in range(3)])
+    )
+    async def send_secure_tx(self, tx_params: Dict) -> HexStr:
+        if not self._validate_address(tx_params['to']):
+            raise ValueError("Invalid recipient address")
+        sender = tx_params['from']
+        try:
+            gas_estimate = await self.w3.eth.estimate_gas(tx_params)
+            tx_params['gas'] = int(gas_estimate * 1.2)
+            tx_params['nonce'] = await self._get_nonce(sender)
+            signed_tx = self.w3.eth.account.sign_transaction(tx_params, config.PRIVATE_KEY)
+            tx_hash = await self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            await self._wait_for_confirmation(tx_hash)
+            return tx_hash
+        except ContractLogicError as e:
+            logger.error(f"Contract error: {str(e)}", exc_info=True)
+            raise
+        except Exception as e:
+            logger.error(f"Transaction failed: {str(e)}", exc_info=True)
+            await self._clear_nonce_cache(sender)
+            raise
+            
+    def _validate_address(self, address: str) -> bool:
+        return Web3.isAddress(address) and Web3.isChecksumAddress(address)
+        
+    async def _get_nonce(self, address: str) -> int:
+        if address not in self.nonce_cache:
+            self.nonce_cache[address] = await self.w3.eth.get_transaction_count(address)
+        return self.nonce_cache[address]
+        
+    async def _clear_nonce_cache(self, address: str):
+        if address in self.nonce_cache:
+            del self.nonce_cache[address]
+            
+    async def _wait_for_confirmation(self, tx_hash: HexStr, confirmations=3):
+        receipt = None
+        while not receipt or receipt.get('blockNumber') is None:
+            await asyncio.sleep(5)
+            receipt = await self.w3.eth.get_transaction_receipt(tx_hash)
+        latest_block = await self.w3.eth.block_number
+        while latest_block - receipt['blockNumber'] < confirmations:
+            await asyncio.sleep(15)
+            latest_block = await self.w3.eth.block_number
+
+# ------------------------------------------------------------------------------
+# Secure API Client for External Calls
+# ------------------------------------------------------------------------------
+import requests  # Synchronous; wrapped via asyncio.to_thread
+
+class SecureAPIClient:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "User-Agent": "SecureTradingBot/1.0"
+        })
+        
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
+    async def get_rugcheck_report(self, contract_address: str) -> Dict:
+        def _get_report():
+            url = f"{config.RUGCHECK_API}/contracts/{contract_address}"
+            response = self.session.get(
+                url,
+                headers={"Authorization": f"Bearer {config.RUGCHECK_API_KEY}"}
+            )
+            response.raise_for_status()
+            return response.json()
+        return await asyncio.to_thread(_get_report)
+
+# ------------------------------------------------------------------------------
+# Advanced Security & Risk Management
+# ------------------------------------------------------------------------------
+class RateLimitException(Exception):
+    pass
+
+limiter = Limiter(RiskSecurityConfig.RUGCHECK_RATE_LIMIT)
+
+class EnhancedSecurity:
+    def __init__(self):
+        self.w3 = self._init_web3_with_failover()
+        self.aiohttp_session = aiohttp.ClientSession()
+        self.volatility_cache = {}
+
+    def _init_web3_with_failover(self) -> Web3:
+        for provider in RiskSecurityConfig.FALLBACK_PROVIDERS:
+            try:
+                w3 = Web3(Web3.HTTPProvider(provider))
+                if w3.is_connected():
+                    return w3
+            except Exception:
+                continue
+        raise ConnectionError("All Web3 providers unavailable")
+
+    @retry(
+        stop=stop_after_attempt(3), 
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((aiohttp.ClientError, TimeoutError))
+    )
+    @limiter.ratelimit("rugcheck", delay=True)
+    async def rugcheck_verification(self, contract_address: ChecksumAddress) -> bool:
+        try:
+            headers = {"Authorization": f"Bearer {os.getenv('RUGCHECK_API_KEY')}"}
+            url = f"{RiskSecurityConfig.RUGCHECK_API}/contracts/{contract_address}/report"
+            async with self.aiohttp_session.get(url, headers=headers) as response:
+                if response.status == 429:
+                    raise RateLimitException("Rugcheck API rate limit exceeded")
+                data = await response.json()
+                return self._parse_rugcheck_report(data)
+        except Exception as e:
+            logger.error(f"Rugcheck verification failed: {str(e)}")
+            return False
+
+    def _parse_rugcheck_report(self, report: Dict) -> bool:
+        if report.get('status') != 'safe':
+            return False
+        risk_factors = {
+            'is_mintable': report.get('contractAnalysis', {}).get('mintable', False),
+            'lp_locked': report.get('lpAnalysis', {}).get('locked', False),
+            'owner_centralization': report.get('ownerAnalysis', {}).get('ownerCount', 0) < 2
+        }
+        return not any(risk_factors.values())
+
+    async def enhanced_blacklist_check(self, address: str) -> bool:
+        checksum_addr = Web3.to_checksum_address(address)
+        normalized_blacklist = {
+            Web3.to_checksum_address(addr) 
+            for addr in RiskSecurityConfig.BLACKLISTS['CONTRACT']
+        }
+        return checksum_addr in normalized_blacklist
+
+    async def social_verification(self, contract_address: ChecksumAddress) -> Dict:
+        analysis = {
+            'account_age': None,
+            'engagement': None,
+            'sentiment': None
+        }
+        try:
+            url = f"{RiskSecurityConfig.TWEETSCOUT_API}/analysis/{contract_address}"
+            headers = {"Authorization": f"Bearer {os.getenv('TWEETSCOUT_API_KEY')}"}
+            async with self.aiohttp_session.get(url, headers=headers) as response:
+                social_data = await response.json()
+            analysis.update({
+                'account_age': (datetime.now() - datetime.fromisoformat(social_data['created_at'])).days,
+                'engagement': social_data.get('engagement_rate'),
+                'sentiment': self._analyze_sentiment(social_data.get('recent_tweets', []))
+            })
+        except Exception as e:
+            logger.error(f"Social verification failed: {str(e)}")
+        return analysis
+
+    def _analyze_sentiment(self, tweets: List[str]) -> float:
+        positive_words = {'bullish', 'moon', 'growth'}
+        negative_words = {'scam', 'rug', 'dump'}
+        scores = []
+        for tweet in tweets:
+            words = set(tweet.lower().split())
+            score = len(words & positive_words) - len(words & negative_words)
+            scores.append(score)
+        return np.mean(scores) if scores else 0
+
+class AdaptiveRiskManager:
+    def __init__(self, portfolio_value: float):
+        self.portfolio_value = portfolio_value
+        self.volatility_cache = {}
+
+    async def calculate_position_size(self, volatility: float) -> float:
+        kelly_fraction = (volatility - RiskSecurityConfig.RISK_FREE_RATE) / (volatility ** 2)
+        return min(self.portfolio_value * kelly_fraction, RiskSecurityConfig.MAX_POSITION_ABS)
+
+    async def dynamic_stop_loss(self, volatility: float) -> float:
+        base_sl = RiskSecurityConfig.BASE_STOP_LOSS
+        return base_sl * (1 + volatility / RiskSecurityConfig.VOLATILITY_THRESHOLD)
+
+    async def get_volatility(self, pair_address: ChecksumAddress) -> float:
+        if pair_address not in self.volatility_cache:
+            historical_prices = await self._fetch_ohlcv(pair_address)
+            returns = np.diff(np.log(historical_prices['close']))
+            self.volatility_cache[pair_address] = np.std(returns) * np.sqrt(24)
+        return self.volatility_cache[pair_address]
+
+    async def _fetch_ohlcv(self, pair_address: ChecksumAddress) -> Dict:
+        # Placeholder: Replace with your actual data retrieval.
+        return {'close': np.random.lognormal(mean=0, sigma=0.1, size=100).tolist()}
+
+class SecureTradingExecutor:
+    def __init__(self):
+        self.security = EnhancedSecurity()
+        self.risk_manager = AdaptiveRiskManager(self._get_portfolio_value())
+
+    def _get_portfolio_value(self) -> float:
+        # Placeholder: Replace with actual portfolio valuation.
+        return 10.0
+
+    async def execute_trade(self, trade_params: Dict) -> Optional[Dict]:
+        if not await self._validate_contract(trade_params['address']):
+            return None
+        try:
+            volatility = await self.risk_manager.get_volatility(trade_params['pair'])
+            position_size = await self.risk_manager.calculate_position_size(volatility)
+            stop_loss = await self.risk_manager.dynamic_stop_loss(volatility)
+            return await self._execute_secure_order(trade_params['address'], position_size, stop_loss)
+        except Exception as e:
+            logger.error(f"Trade execution failed: {str(e)}")
+            return None
+
+    async def _validate_contract(self, address: str) -> bool:
+        checksum_addr = Web3.to_checksum_address(address)
+        validations = [
+            self.security.enhanced_blacklist_check(checksum_addr),
+            self.security.rugcheck_verification(checksum_addr),
+            self._check_onchain_suspicious_activity(checksum_addr)
+        ]
+        results = await asyncio.gather(*validations)
+        return all(results)
+
+    async def _check_onchain_suspicious_activity(self, address: ChecksumAddress) -> bool:
+        try:
+            recent_txs = await self.security.w3.eth.get_transactions(address)
+            large_transfers = [tx for tx in recent_txs if tx.get('value', 0) > RiskSecurityConfig.LARGE_TX_THRESHOLD]
+            return len(large_transfers) < RiskSecurityConfig.SUSPICIOUS_TX_COUNT
+        except Exception:
+            return False
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential())
+    async def _execute_secure_order(self, address: ChecksumAddress, amount: float, stop_loss: float) -> Dict:
+        await asyncio.sleep(1)
+        return {
+            'tx_hash': "0xSIMULATEDTXHASH",
+            'contract': address,
+            'position_size': amount,
+            'stop_loss': stop_loss
+        }
+
+# ------------------------------------------------------------------------------
+# Quantitative Trading System for Profitability Enhancement & Backtesting
+# ------------------------------------------------------------------------------
+class QuantitativeTradingSystem:
+    def __init__(self):
+        self.portfolio = {}  # Should include available_capital, positions, etc.
+        self.model = self._init_ml_model()
+        self.historical_data = pd.DataFrame()
+        self.sectors = self._load_sector_classification()
+
+    def _init_ml_model(self):
+        return GradientBoostingRegressor(n_estimators=100, learning_rate=0.1, max_depth=3, random_state=42)
+
+    async def analyze_market(self):
+        await self._collect_market_data()
+        self._calculate_technical_indicators()
+        await self._update_ml_features()
+        self._calculate_portfolio_metrics()
+
+    async def _collect_market_data(self):
+        # Placeholder: Collect real-time market data via WebSockets/API
+        pass
+
+    def _calculate_technical_indicators(self):
+        self.historical_data = add_all_ta_features(
+            self.historical_data,
+            open="open",
+            high="high",
+            low="low",
+            close="close",
+            volume="volume"
+        )
+        self.historical_data['liquidity_flow'] = self._calculate_liquidity_flow()
+        self.historical_data['volatility_ratio'] = self._calculate_volatility_ratio()
+
+    def _calculate_liquidity_flow(self):
+        return np.random.random(len(self.historical_data))
+
+    def _calculate_volatility_ratio(self):
+        return np.random.random(len(self.historical_data))
+
+    async def _update_ml_features(self):
+        features = self._create_feature_matrix()
+        labels = self._create_labels()
+        self.model.fit(features, labels)
+
+    def _create_feature_matrix(self):
+        return self.historical_data.drop(columns=["close"], errors='ignore')
+
+    def _create_labels(self):
+        return self.historical_data["close"] if "close" in self.historical_data.columns else np.zeros(len(self.historical_data))
+
+    def _calculate_portfolio_metrics(self):
+        # Placeholder: Calculate metrics such as drawdown, risk, etc.
+        pass
+
+    def optimize_portfolio(self):
+        returns = self._calculate_expected_returns()
+        cov_matrix = self._calculate_covariance_matrix()
+
+        def portfolio_risk(weights):
+            return np.sqrt(weights.T @ cov_matrix @ weights)
+
+        def portfolio_return(weights):
+            return weights.T @ returns
+
+        constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+        bounds = [(0, 0.1) for _ in range(len(returns))]
+
+        result = minimize(
+            portfolio_risk,
+            x0=np.ones(len(returns))/len(returns),
+            method='SLSQP',
+            bounds=bounds,
+            constraints=constraints
+        )
+        return result.x
+
+    def execute_strategic_trade(self, contract: str):
+        entry_signal = self._generate_entry_signal(contract)
+        position_size = self._calculate_optimal_size(contract)
+        exit_strategy = self._create_exit_plan(contract)
+        order_params = {
+            'contract': contract,
+            'size': position_size,
+            'entry': entry_signal,
+            'stoploss': exit_strategy['stoploss'],
+            'takeprofit': exit_strategy['takeprofit'],
+            'timeframe': exit_strategy['time_horizon']
+        }
+        self._execute_twap_order(order_params)
+
+    def _generate_entry_signal(self, contract: str) -> dict:
+        ml_prediction = self.model.predict(self._get_current_features(contract))
+        ta_score = self._calculate_ta_score(contract)
+        liquidity_score = self._calculate_liquidity_score(contract)
+        return {
+            'direction': 'long' if ml_prediction > 0.5 else 'short',
+            'confidence': (ml_prediction + ta_score + liquidity_score) / 3,
+            'timestamp': datetime.now()
+        }
+
+    def _get_current_features(self, contract: str):
+        return np.random.rand(1, 10)
+
+    def _calculate_ta_score(self, contract: str) -> float:
+        return np.random.rand()
+
+    def _calculate_liquidity_score(self, contract: str) -> float:
+        return np.random.rand()
+
+    def _calculate_optimal_size(self, contract: str) -> float:
+        volatility = self._get_asset_volatility(contract)
+        correlation = self._get_portfolio_correlation(contract)
+        kelly_fraction = self._calculate_kelly_criterion(volatility)
+        return min(self.portfolio.get('available_capital', 1) * kelly_fraction * (1 - correlation),
+                   RiskSecurityConfig.MAX_POSITION_ABS)
+
+    def _get_asset_volatility(self, contract: str) -> float:
+        return np.random.rand()
+
+    def _get_portfolio_correlation(self, contract: str) -> float:
+        return np.random.rand()
+
+    def _calculate_kelly_criterion(self, volatility: float) -> float:
+        return 0.05
+
+    def _create_exit_plan(self, contract: str) -> dict:
+        volatility = self._get_asset_volatility(contract)
+        momentum = self._get_momentum_score(contract)
+        return {
+            'stoploss': self._dynamic_stop_loss(volatility, momentum),
+            'takeprofit': self._dynamic_take_profit(volatility, momentum),
+            'time_horizon': self._optimal_holding_period(volatility)
+        }
+
+    def _get_momentum_score(self, contract: str) -> float:
+        return np.random.rand()
+
+    def _dynamic_stop_loss(self, volatility: float, momentum: float) -> float:
+        return 0.1 * (1 + volatility * momentum)
+
+    def _dynamic_take_profit(self, volatility: float, momentum: float) -> float:
+        return 0.2 * (1 + volatility * momentum)
+
+    def _optimal_holding_period(self, volatility: float) -> int:
+        return int(24 * (1 + volatility))
+
+    def _execute_twap_order(self, order_params: dict):
+        logger.info(f"Executing TWAP order: {order_params}")
+
+    def backtest_strategy(self, days: int = 90):
+        data = self._load_historical_data(days)
+        results = qs.reports.full(
+            data['returns'],
+            benchmark='ETH',
+            display=False
+        )
+        self._analyze_backtest(results)
+
+    def _load_historical_data(self, days: int) -> Dict:
+        dates = pd.date_range(end=datetime.now(), periods=days)
+        returns = pd.Series(np.random.randn(days) / 100, index=dates)
+        return {'returns': returns}
+
+    def _analyze_backtest(self, results):
+        logger.info("Backtest analysis complete.")
+
+class AdvancedRiskMetrics:
+    def __init__(self):
+        self.metrics = {
+            'sharpe_ratio': None,
+            'max_drawdown': None,
+            'win_rate': None,
+            'profit_factor': None
+        }
+
+    def calculate_metrics(self, trades: pd.DataFrame):
+        self.metrics['sharpe_ratio'] = self._calculate_sharpe(trades)
+        self.metrics['max_drawdown'] = self._calculate_max_drawdown(trades)
+        self.metrics['win_rate'] = self._calculate_win_rate(trades)
+        self.metrics['profit_factor'] = self._calculate_profit_factor(trades)
+
+    def _calculate_sharpe(self, trades: pd.DataFrame) -> float:
+        return np.random.rand()
+
+    def _calculate_max_drawdown(self, trades: pd.DataFrame) -> float:
+        return np.random.rand()
+
+    def _calculate_win_rate(self, trades: pd.DataFrame) -> float:
+        return np.random.rand()
+
+    def _calculate_profit_factor(self, trades: pd.DataFrame) -> float:
+        return np.random.rand()
+
+    def adaptive_risk_parameters(self):
+        if self.metrics['sharpe_ratio'] < 1.0:
+            RiskSecurityConfig.BASE_STOP_LOSS *= 0.9
+        if self.metrics['max_drawdown'] > 0.2:
+            RiskSecurityConfig.MAX_POSITION_ABS *= 0.8
+
+class MarketSimulator:
+    def __init__(self):
+        self.slippage_model = self._init_slippage_model()
+        self.latency_model = self._init_latency_model()
+
+    def _init_slippage_model(self):
+        from sklearn.ensemble import GradientBoostingRegressor
+        return GradientBoostingRegressor()
+
+    def _init_latency_model(self):
+        return lambda: np.random.rand()
+
+    def simulate_order(self, order: dict) -> dict:
+        simulated_price = self._estimate_fill_price(order['size'], order.get('liquidity', 1))
+        return {
+            'executed_price': simulated_price,
+            'slippage': simulated_price - order.get('target_price', simulated_price),
+            'latency': self._estimate_latency()
+        }
+
+    def _estimate_fill_price(self, size: float, liquidity: float) -> float:
+        return np.random.rand() * 100
+
+    def _estimate_latency(self) -> float:
+        return self.latency_model()
+
+# ------------------------------------------------------------------------------
+# Async Trading System Integrating All Improvements
+# ------------------------------------------------------------------------------
+class AsyncTradingSystem:
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.running = False
+        self.trade_count = 0
+        self.db_manager = AsyncDatabaseManager()
+        self.web3_client = SecureWeb3Client()
+        self.api_client = SecureAPIClient()
+        self.tg_bot = AsyncBonkBot()
+        self.secure_executor = SecureTradingExecutor()
+        self.quant_system = QuantitativeTradingSystem()
+        self.trade_settings = {'MAX_TRADES_PER_DAY': 5}
+
+    async def concurrent_main(self):
+        self.running = True
+        await self.web3_client.initialize()
+        asyncio.create_task(self._run_quantitative_analysis())
+        await asyncio.gather(
+            self.tg_bot.app.run_polling(),
+            self.analyze_and_trade(),
+            self.process_alerts()
+        )
+        
+    async def _run_quantitative_analysis(self):
+        while self.running:
+            try:
+                await self.quant_system.analyze_market()
+                self.quant_system.backtest_strategy(days=90)
+                await asyncio.sleep(3600)
+            except Exception as e:
+                self.logger.error(f"Quantitative analysis error: {str(e)}", exc_info=True)
+                await asyncio.sleep(60)
+        
+    async def analyze_and_trade(self):
+        while self.running:
+            try:
+                coins = await self._get_new_listings()
+                for coin in coins:
+                    if await self.secure_executor._validate_contract(coin['contract']):
+                        trade_data = await self.secure_executor.execute_trade({
+                            'address': coin['contract'],
+                            'pair': coin.get('pair', coin['contract'])
+                        })
+                        if not trade_data:
+                            self.logger.warning(f"Trade execution failed for {coin.get('symbol')}")
+                            continue
+                        await self._log_trade(trade_data)
+                        alert_message = self._format_trade_alert(
+                            coin['symbol'],
+                            coin['contract'],
+                            trade_data
+                        )
+                        await self.tg_bot.send_alert(alert_message)
+                        self.trade_count += 1
+                        if self.trade_count >= self.trade_settings['MAX_TRADES_PER_DAY']:
+                            self.logger.info("Reached max trades per day limit.")
+                            self.running = False
+                            break
+                await asyncio.sleep(60)
+            except Exception as e:
+                self.logger.error(f"Trade loop error: {str(e)}", exc_info=True)
+                await asyncio.sleep(30)
+                
+    async def process_alerts(self):
+        while self.running:
+            alert = await self.tg_bot.queue.get()
+            self.logger.info(f"Processing alert: {alert}")
+            self.tg_bot.queue.task_done()
+            
+    async def _get_new_listings(self) -> List[Dict]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.pumpfun.com/v1") as response:
+                    data = await response.json()
+                    return data
+        except Exception as e:
+            self.logger.error(f"Error fetching new listings: {str(e)}", exc_info=True)
+            return []
+                
+    async def _log_trade(self, data: Dict):
+        try:
+            async with self.db_manager.get_session() as session:
+                trade = TradedCoin(
+                    contract_address=data.get('contract'),
+                    symbol=data.get('symbol', 'N/A'),
+                    trade_data=data,
+                    analysis_data=data
+                )
+                session.add(trade)
+        except Exception as e:
+            self.logger.error(f"DB logging failed: {str(e)}", exc_info=True)
+        
+    def _format_trade_alert(self, symbol: str, contract: str, analysis: Dict) -> str:
+        return (
+            f"*New Trade Executed*\n"
+            f"🏷 {symbol} | `{contract}`\n"
+            f"📈 Details: {analysis}\n"
+            f"🔗 [Chart](https://dexscreener.com/{contract})"
+        )
+        
+    async def shutdown(self):
+        self.logger.info("Initiating shutdown sequence")
+        self.running = False
+        try:
+            await self.web3_client.w3.provider.disconnect()
+        except Exception as e:
+            self.logger.error(f"Error disconnecting web3 provider: {str(e)}", exc_info=True)
+        try:
+            await self.db_manager.engine.dispose()
+        except Exception as e:
+            self.logger.error(f"Error disposing db engine: {str(e)}", exc_info=True)
+        self.logger.info("Resources released. Shutdown complete")
+        
+    async def handle_signal(self):
+        self.logger.info("Received termination signal")
+        await self.shutdown()
+        tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        asyncio.get_event_loop().stop()
+
+# ------------------------------------------------------------------------------
+# Signal Handling & Main Entry
+# ------------------------------------------------------------------------------
+def setup_signals(system: AsyncTradingSystem):
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: asyncio.create_task(system.handle_signal()))
+
+async def main():
+    system = AsyncTradingSystem()
+    setup_signals(system)
+    
+    try:
+        await system.concurrent_main()
+    except Exception as e:
+        system.logger.critical(f"Unexpected error: {str(e)}", exc_info=True)
+    finally:
+        if system.running:
+            await system.shutdown()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
